@@ -6,8 +6,12 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Rect
-import android.media.*
+import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaCodecList
 import android.media.MediaCodecList.REGULAR_CODECS
+import android.media.MediaExtractor
+import android.media.MediaFormat
 import android.os.Build
 import android.util.Log
 import android.view.Surface
@@ -37,19 +41,23 @@ const val SECOND_IN_USEC = 1000000
 const val TIMEOUT_USEC = 10000
 
 class FrameBuilder(
-        private val context: Context,
-        private val muxerConfig: MuxerConfig,
-        @RawRes private val audioTrackResource: Int?
+    private val context: Context,
+    private val muxerConfig: MuxerConfig,
+    @RawRes private val audioTrackResource: Int?
 ) {
 
     private val mediaFormat: MediaFormat = run {
-        val format = MediaFormat.createVideoFormat(muxerConfig.mimeType, muxerConfig
-                .videoWidth, muxerConfig.videoHeight)
+        val format = MediaFormat.createVideoFormat(
+            muxerConfig.mimeType, muxerConfig
+                .videoWidth, muxerConfig.videoHeight
+        )
 
         // Set some properties.  Failing to specify some of these can cause the MediaCodec
         // configure() call to throw an unhelpful exception.
-        format.setInteger(MediaFormat.KEY_COLOR_FORMAT,
-                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+        format.setInteger(
+            MediaFormat.KEY_COLOR_FORMAT,
+            MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
+        )
         format.setInteger(MediaFormat.KEY_BIT_RATE, muxerConfig.bitrate)
         format.setFloat(MediaFormat.KEY_FRAME_RATE, muxerConfig.framesPerSecond)
         format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, muxerConfig.iFrameInterval)
@@ -69,12 +77,13 @@ class FrameBuilder(
 
     private var audioExtractor: MediaExtractor? = run {
         if (audioTrackResource != null) {
-            val assetFileDescriptor: AssetFileDescriptor = context.resources.openRawResourceFd(audioTrackResource)
+            val assetFileDescriptor: AssetFileDescriptor =
+                context.resources.openRawResourceFd(audioTrackResource)
             val extractor = MediaExtractor()
             extractor.setDataSource(
-                    assetFileDescriptor.fileDescriptor,
-                    assetFileDescriptor.startOffset,
-                    assetFileDescriptor.length
+                assetFileDescriptor.fileDescriptor,
+                assetFileDescriptor.startOffset,
+                assetFileDescriptor.length
             )
             extractor
         } else {
@@ -101,16 +110,27 @@ class FrameBuilder(
                     val bitmap = BitmapFactory.decodeResource(context.resources, image)
                     drawBitmapAndPostCanvas(bitmap, canvas)
                 }
+
                 is Bitmap -> drawBitmapAndPostCanvas(image, canvas)
                 is Canvas -> postCanvasFrame(image)
-                else -> Log.e(TAG, "Image type $image is not supported. Try using a Canvas or a Bitmap")
+                else -> Log.e(
+                    TAG,
+                    "Image type $image is not supported. Try using a Canvas or a Bitmap"
+                )
             }
         }
     }
 
     private fun createCanvas(): Canvas? {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            surface?.lockHardwareCanvas()
+            if (Build.VERSION.SDK_INT >= 31
+                && Build.MANUFACTURER.contains("xiaomi", true)
+                || Build.MANUFACTURER.contains("redmi", true)
+            ) {
+                surface?.lockCanvas(null)
+            } else {
+                surface?.lockHardwareCanvas()
+            }
         } else {
             surface?.lockCanvas(rect)
         }
@@ -152,8 +172,10 @@ class FrameBuilder(
         }
         var encoderOutputBuffers: Array<ByteBuffer?>? = mediaCodec.getOutputBuffers()
         while (true) {
-            val encoderStatus: Int = mediaCodec.dequeueOutputBuffer(bufferInfo, TIMEOUT_USEC
-                    .toLong())
+            val encoderStatus: Int = mediaCodec.dequeueOutputBuffer(
+                bufferInfo, TIMEOUT_USEC
+                    .toLong()
+            )
             if (encoderStatus == MediaCodec.INFO_TRY_AGAIN_LATER) {
                 // no output available yet
                 if (!endOfStream) {
@@ -179,7 +201,7 @@ class FrameBuilder(
                 // let's ignore it
             } else {
                 val encodedData = encoderOutputBuffers?.get(encoderStatus)
-                        ?: throw RuntimeException("encoderOutputBuffer  $encoderStatus was null")
+                    ?: throw RuntimeException("encoderOutputBuffer  $encoderStatus was null")
                 if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
                     // The codec config data was pulled out and fed to the muxer when we got
                     // the INFO_OUTPUT_FORMAT_CHANGED status.  Ignore it.
@@ -207,35 +229,45 @@ class FrameBuilder(
     }
 
     fun muxAudioFrames() {
-        val sampleSize = 256 * 1024
-        val offset = 100
-        val audioBuffer = ByteBuffer.allocate(sampleSize)
-        val audioBufferInfo = MediaCodec.BufferInfo()
-        var sawEOS = false
-        audioExtractor!!.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
-        var finalAudioTime: Long
-        val finalVideoTime: Long = frameMuxer.getVideoTime()
-        var audioTrackFrameCount = 0
-        while (!sawEOS) {
-            audioBufferInfo.offset = offset
-            audioBufferInfo.size = audioExtractor!!.readSampleData(audioBuffer, offset)
-            if (audioBufferInfo.size < 0) {
-                if (VERBOSE) Log.d(TAG, "Saw input EOS.")
-                audioBufferInfo.size = 0
-                sawEOS = true
-            } else {
-                finalAudioTime = audioExtractor!!.sampleTime
-                audioBufferInfo.presentationTimeUs = finalAudioTime
-                audioBufferInfo.flags = audioExtractor!!.sampleFlags
-                frameMuxer.muxAudioFrame(audioBuffer, audioBufferInfo)
-                audioExtractor!!.advance()
-                audioTrackFrameCount++
-                if (VERBOSE) Log.d(TAG, "Frame ($audioTrackFrameCount Flags: ${audioBufferInfo.flags} Size(KB): ${audioBufferInfo.size / 1024}")
-                // We want the sound to play for a few more seconds after the last image
-                if ((finalAudioTime > finalVideoTime) &&
-                        (finalAudioTime % finalVideoTime > muxerConfig.framesPerImage * SECOND_IN_USEC)) {
+        audioExtractor?.let { audioExtractor ->
+
+            val sampleSize = 256 * 1024
+            val offset = 100
+            val audioBuffer = ByteBuffer.allocate(sampleSize)
+            val audioBufferInfo = MediaCodec.BufferInfo()
+            var sawEOS = false
+            audioExtractor.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+            var finalAudioTime: Long
+            val finalVideoTime: Long = frameMuxer.getVideoTime()
+            var audioTrackFrameCount = 0
+            while (!sawEOS) {
+                audioBufferInfo.offset = offset
+                audioBufferInfo.size = audioExtractor.readSampleData(audioBuffer, offset)
+                if (audioBufferInfo.size < 0) {
+                    if (VERBOSE) Log.d(TAG, "Saw input EOS.")
+                    audioBufferInfo.size = 0
                     sawEOS = true
-                    if (VERBOSE) Log.d(TAG, "Final audio time: $finalAudioTime video time: $finalVideoTime")
+                } else {
+                    finalAudioTime = audioExtractor.sampleTime
+                    audioBufferInfo.presentationTimeUs = finalAudioTime
+                    audioBufferInfo.flags = audioExtractor.sampleFlags
+                    frameMuxer.muxAudioFrame(audioBuffer, audioBufferInfo)
+                    audioExtractor.advance()
+                    audioTrackFrameCount++
+                    if (VERBOSE) Log.d(
+                        TAG,
+                        "Frame ($audioTrackFrameCount Flags: ${audioBufferInfo.flags} Size(KB): ${audioBufferInfo.size / 1024}"
+                    )
+                    // We want the sound to play for a few more seconds after the last image
+                    if ((finalAudioTime > finalVideoTime) &&
+                        (finalAudioTime % finalVideoTime > muxerConfig.framesPerImage * SECOND_IN_USEC)
+                    ) {
+                        sawEOS = true
+                        if (VERBOSE) Log.d(
+                            TAG,
+                            "Final audio time: $finalAudioTime video time: $finalVideoTime"
+                        )
+                    }
                 }
             }
         }
